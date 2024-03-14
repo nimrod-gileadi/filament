@@ -168,6 +168,8 @@ if (FILAMENT_SUPPORTS_VULKAN)
             include/backend/platforms/VulkanPlatform.h
             src/vulkan/caching/VulkanDescriptorSet.cpp
             src/vulkan/caching/VulkanDescriptorSet.h
+            src/vulkan/caching/VulkanPipeline.cpp
+            src/vulkan/caching/VulkanPipeline.h
             src/vulkan/platform/VulkanPlatform.cpp
             src/vulkan/platform/VulkanPlatformSwapChainImpl.cpp
             src/vulkan/platform/VulkanPlatformSwapChainImpl.h

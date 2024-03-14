@@ -51,7 +51,9 @@ VulkanTexture::VulkanTexture(VkDevice device, VmaAllocator allocator, VulkanComm
       mStagePool(stagePool),
       mDevice(device),
       mAllocator(allocator),
-      mCommands(commands) {}
+      mCommands(commands) {
+    utils::slog.e <<"------> " << mTextureImage << utils::io::endl;
+}
 
 VulkanTexture::VulkanTexture(VkDevice device, VkPhysicalDevice physicalDevice,
         VulkanContext const& context, VmaAllocator allocator, VulkanCommands* commands,
@@ -70,19 +72,30 @@ VulkanTexture::VulkanTexture(VkDevice device, VkPhysicalDevice physicalDevice,
       mCommands(commands) {
 
     // Create an appropriately-sized device-only VkImage, but do not fill it yet.
-    VkImageCreateInfo imageInfo{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .imageType = target == SamplerType::SAMPLER_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
-            .format = mVkFormat,
-            .extent = {w, h, depth},
-            .mipLevels = levels,
-            .arrayLayers = 1,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = 0};
+    VkImageCreateInfo imageInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = target == SamplerType::SAMPLER_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+        .format = mVkFormat,
+        .extent = {w, h, depth},
+        .mipLevels = levels,
+        .arrayLayers = 1,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = 0,
+    };
+    if (target == SamplerType::SAMPLER_3D) {
+//        utils::slog.e <<"texture=" << this << " 3d" << utils::io::endl;
+    }
+    if (target == SamplerType::SAMPLER_2D) {
+//        utils::slog.e <<"texture=" << this << " 2d" << utils::io::endl;
+    }
     if (target == SamplerType::SAMPLER_CUBEMAP) {
+        
+//        utils::slog.e <<"texture=" << this << " cubemap" << utils::io::endl;
         imageInfo.arrayLayers = 6;
         imageInfo.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
     if (target == SamplerType::SAMPLER_2D_ARRAY) {
+//        utils::slog.e <<"texture=" << this << " 2d-array" << utils::io::endl;
         imageInfo.arrayLayers = depth;
         imageInfo.extent.depth = 1;
         // NOTE: We do not use VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT here because:
@@ -94,6 +107,7 @@ VulkanTexture::VulkanTexture(VkDevice device, VkPhysicalDevice physicalDevice,
         // not the VkImage.
     }
     if (target == SamplerType::SAMPLER_CUBEMAP_ARRAY) {
+//        utils::slog.e <<"texture=" << this << " cubemap-array" << utils::io::endl;
         imageInfo.arrayLayers = depth * 6;
         imageInfo.extent.depth = 1;
     }
@@ -120,6 +134,9 @@ VulkanTexture::VulkanTexture(VkDevice device, VkPhysicalDevice physicalDevice,
 #endif
 
         imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    }
+    if (any(usage & TextureUsage::BLIT_SRC) || any(usage & TextureUsage::BLIT_DST)) {
+        imageInfo.usage |= blittable;
     }
     if (any(usage & TextureUsage::COLOR_ATTACHMENT)) {
         imageInfo.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | blittable;
@@ -163,8 +180,8 @@ VulkanTexture::VulkanTexture(VkDevice device, VkPhysicalDevice physicalDevice,
     imageInfo.samples = (VkSampleCountFlagBits) samples;
 
     VkResult error = vkCreateImage(mDevice, &imageInfo, VKALLOC, &mTextureImage);
-    if (error || FVK_ENABLED(FVK_DEBUG_TEXTURE)) {
-        utils::slog.d << "vkCreateImage: "
+    if (error || FVK_ENABLED(FVK_DEBUG_TEXTURE) || true) {
+        utils::slog.e << "vkCreateImage: "
             << "image = " << mTextureImage << ", "
             << "result = " << error << ", "
             << "handle = " << utils::io::hex << mTextureImage << utils::io::dec << ", "

@@ -15,148 +15,133 @@
  */
 
 #include "VulkanDescriptorSet.h"
+#include "utils/Panic.h"
+#include "vulkan/VulkanHandles.h"
+#include "vulkan/VulkanUtility.h"
+#include "vulkan/vulkan_core.h"
 
 #include <vulkan/VulkanConstants.h>
+#include <vulkan/VulkanImageUtility.h>
 #include <vulkan/VulkanResources.h>
 
+#include <memory>
 #include <type_traits>
+#include <vector>
+
+#include <math.h>
 
 namespace filament::backend {
 
 namespace {
 
-template<typename MaskType>
-using LayoutMap = tsl::robin_map<MaskType, VkDescriptorSetLayout>;
-using LayoutArray = VulkanDescriptorSetManager::LayoutArray;
-using UniformBufferBitmask = VulkanDescriptorSetManager::UniformBufferBitmask;
-using SamplerBitmask = VulkanDescriptorSetManager::SamplerBitmask;
+using ImgUtil = VulkanImageUtility;
+using Bitmask = VulkanDescriptorSetLayout::Bitmask;
 
-constexpr uint8_t EXPECTED_IN_FLIGHT_FRAMES = 3; // Asssume triple buffering
+constexpr uint8_t EXPECTED_IN_FLIGHT_FRAMES = 3;// Asssume triple buffering
+constexpr uint8_t DESCRIPTOR_TYPE_COUNT = 3;
 
-#define PORT_CONSTANT(NameSpace, K) constexpr decltype(NameSpace::K) K = NameSpace::K;
+// This assumes we have at most 32-bound samplers, 10 UBOs and, 1 input attachment.
+// TODO: Safe to remove after [UPCOMING_CHANGE]
+constexpr uint8_t MAX_SAMPLER_BINDING = 32;
+constexpr uint8_t MAX_UBO_BINDING = 10;
+constexpr uint8_t MAX_INPUT_ATTACHMENT_BINDING = 1;
+constexpr uint8_t MAX_BINDINGS = MAX_SAMPLER_BINDING + MAX_UBO_BINDING + MAX_INPUT_ATTACHMENT_BINDING;
 
-PORT_CONSTANT(VulkanDescriptorSetManager, MAX_SUPPORTED_SHADER_STAGE)
-PORT_CONSTANT(VulkanDescriptorSetManager, VERTEX_STAGE)
-PORT_CONSTANT(VulkanDescriptorSetManager, FRAGMENT_STAGE)
+// This struct can be used to indicate the count of each type of descriptor with respect to a
+// layout, or it can be used to indicate the size and capacity of a descriptor pool.
+struct DescriptorCount {
+    uint32_t ubo = 0;
+    uint32_t dynamicUbo = 0;
+    uint32_t sampler = 0;
+    uint32_t inputAttachment = 0;
 
-PORT_CONSTANT(Program, UNIFORM_BINDING_COUNT)
-PORT_CONSTANT(Program, SAMPLER_BINDING_COUNT)
-
-#undef PORT_CONSTANT
-
-// Use constexpr to statically generate a bit count table for 8-bit numbers.
-struct BitCountHelper {
-    constexpr BitCountHelper() : data{} {
-        for (uint16_t i = 0; i < 256; ++i) {
-            data[i] = 0;
-            for (auto j = i; j > 0; j /= 2) {
-                if (j & 1) {
-                    data[i]++;
-                }
-            }
-        }
+    bool operator==(DescriptorCount const& right) const noexcept {
+        return ubo == right.ubo && dynamicUbo == right.dynamicUbo &&
+                sampler == right.sampler && inputAttachment == right.inputAttachment;
     }
-    uint8_t data[256];
-} BitCountImpl;
 
-inline uint8_t countBits(uint32_t num) {
-    static constexpr uint8_t const* BIT_COUNT = BitCountImpl.data;
-    return BIT_COUNT[num & 0xFF] + BIT_COUNT[(num >> 8) & 0xFF] + BIT_COUNT[(num >> 16) & 0xFF] +
-           BIT_COUNT[(num >> 24) & 0xFF];
-}
+    static inline DescriptorCount fromLayoutBitmask(Bitmask const& mask) {
+        return {
+            .ubo = BitCounter.count(collapse(mask.ubo)),
+            .dynamicUbo = BitCounter.count(collapse(mask.dynamicUbo)),
+            .sampler = BitCounter.count(collapse(mask.sampler)),
+            .inputAttachment = BitCounter.count(collapse(mask.inputAttachment)),
+        };
+    }
 
-struct SamplerSet {
-    using Mask = UniformBufferBitmask;
-    struct Key {
-        Mask mask;
-        static_assert(sizeof(Mask) == 4);
-        uint32_t padding;// We need a padding to ensure 8-byte alignement.
-        VkDescriptorSetLayout layout;
-        VkSampler sampler[SAMPLER_BINDING_COUNT];
-        VkImageView imageView[SAMPLER_BINDING_COUNT];
-        VkImageLayout imageLayout[SAMPLER_BINDING_COUNT];
-    };
+    DescriptorCount operator*(uint16_t mult) const noexcept {
+        // TODO: check for overflow.
 
-    struct Equal {
-        bool operator()(Key const& k1, Key const& k2) const {
-            if (k1.mask != k2.mask) return false;
-            if (k1.layout != k2.layout) return false;
-
-            for (uint8_t i = 0, bitCount = countBits(k1.mask); i < bitCount; ++i) {
-                if (k1.sampler[i] != k2.sampler[i] || k1.imageView[i] != k2.imageView[i] ||
-                        k1.imageLayout[i] != k2.imageLayout[i]) {
-                    return false;
-                }
-            }
-            return true;
-        }
-    };
-    using HashFn = utils::hash::MurmurHashFn<Key>;
-    using Cache = std::unordered_map<Key, VulkanDescriptorSet*, HashFn, Equal>;
+        DescriptorCount ret;
+        ret.ubo = ubo * mult;
+        ret.dynamicUbo = dynamicUbo * mult;
+        ret.sampler = sampler * mult;
+        ret.inputAttachment = inputAttachment * mult;
+        return ret;
+    }
+private:
+    // We care about the number of bindings in both stages, so we collapse the mask into the lower
+    // half (i.e. vertex stage) n-bits of the mask for counting the total number of unique
+    // descriptors.
+    template<typename MaskType>
+    inline static MaskType collapse(MaskType mask) {
+        constexpr uint8_t NBITS_DIV_2 = sizeof(MaskType) * 4;
+        // First zero out the top-half and then or the bottom-half against the original top-half.
+        return ((mask << NBITS_DIV_2) >> NBITS_DIV_2) | (mask >> NBITS_DIV_2);
+    }
 };
 
-struct UBOSet {
-    using Mask = SamplerBitmask;
-
-    struct Key {
-        Mask mask;
-        static_assert(sizeof(Mask) == 4);
-        uint32_t padding;// We need a padding to ensure 8-byte alignement.
-        VkDescriptorSetLayout layout;
-        VkBuffer buffers[UNIFORM_BINDING_COUNT];    //   80     0
-        VkDeviceSize offsets[UNIFORM_BINDING_COUNT];//   40  1592
-        VkDeviceSize sizes[UNIFORM_BINDING_COUNT];  //   40  1632
-    };
-
-    struct Equal {
-        bool operator()(Key const& k1, Key const& k2) const {
-            if (k1.mask != k2.mask) return false;
-            if (k1.layout != k2.layout) return false;
-
-            for (uint8_t i = 0, bitCount = countBits(k1.mask); i < bitCount; ++i) {
-                if (k1.buffers[i] != k2.buffers[i] || k1.offsets[i] != k2.offsets[i] ||
-                        k1.sizes[i] != k2.sizes[i]) {
-                    return false;
-                }
-            }
-            return true;
-        }
-    };
-    using HashFn = utils::hash::MurmurHashFn<Key>;
-    using Cache = std::unordered_map<Key, VulkanDescriptorSet*, HashFn, Equal>;
-};
-
-constexpr uint8_t MAX_BINDINGS = UNIFORM_BINDING_COUNT * MAX_SUPPORTED_SHADER_STAGE;
-static_assert(MAX_BINDINGS >= SAMPLER_BINDING_COUNT * MAX_SUPPORTED_SHADER_STAGE);
-
-template<typename TYPE>
+// We create a pool for each layout as defined by the number of descriptors of each type. For
+// example, a layout of
+// 'A' =>
+//   layout(binding = 0, set = 1) uniform {};
+//   layout(binding = 1, set = 1) sampler1;
+//   layout(binding = 2, set = 1) sampler2;
+//
+// would be equivalent to
+// 'B' =>
+//   layout(binding = 1, set = 2) uniform {};
+//   layout(binding = 2, set = 2) sampler2;
+//   layout(binding = 3, set = 2) sampler3;
+//
+// TODO: we might do better if we understand the types of unique layouts and can combine them in a
+// single pool without too much waste.
 class DescriptorPool {
 private:
-    static constexpr uint32_t COUNT_MULTIPLIER =
-            MAX_SUPPORTED_SHADER_STAGE * EXPECTED_IN_FLIGHT_FRAMES;
-    static constexpr uint32_t CAPACITY =
-            std::is_same_v<TYPE, UBOSet> ? Program::UNIFORM_BINDING_COUNT * COUNT_MULTIPLIER
-                                         : Program::SAMPLER_BINDING_COUNT * COUNT_MULTIPLIER;
-
+    using Count = DescriptorCount;
 public:
-    DescriptorPool()
-        : mDevice(VK_NULL_HANDLE),
-          mResourceAllocator(nullptr) {}
-
-    DescriptorPool(VkDevice device, VulkanResourceAllocator* allocator)
+    DescriptorPool(VkDevice device, VulkanResourceAllocator* allocator,
+            VulkanDescriptorSetLayout* layout, uint16_t capacity)
         : mDevice(device),
-          mResourceAllocator(allocator) {
-        VkDescriptorPoolSize sizes[1] = {
+          mAllocator(allocator),
+          mVkLayout(layout->vklayout),
+          mCount(DescriptorCount::fromLayoutBitmask(layout->bitmask)),
+          mCapacity(capacity) {
+        Count const actual = mCount * capacity;
+        VkDescriptorPoolSize sizes[4] = {
             {
-                .type = std::is_same_v<TYPE, UBOSet> ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-                                                     : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                .descriptorCount = CAPACITY,
+                .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = actual.ubo,
+            },
+            {
+                .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                .descriptorCount = actual.dynamicUbo,
+            },
+            {
+                .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = actual.sampler,
+            },
+            {
+                .type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                .descriptorCount = actual.inputAttachment,
             },
         };
         VkDescriptorPoolCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
             .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = EXPECTED_IN_FLIGHT_FRAMES,
-            .poolSizeCount = 1,
+            .maxSets = capacity,
+            .poolSizeCount = 4,
             .pPoolSizes = sizes,
         };
         vkCreateDescriptorPool(mDevice, &info, VKALLOC, &mPool);
@@ -169,453 +154,454 @@ public:
         vkDestroyDescriptorPool(mDevice, mPool, VKALLOC);
     }
 
-    VulkanDescriptorSet* obtainSet(VkDescriptorSetLayout layout) {
-        if (mCount == CAPACITY) {
-            return nullptr;
-        }
+    uint16_t const& capacity() {
+        return mCapacity;
+    }
 
-        if (auto unused = mUnused.find(layout);
-                unused != mUnused.end() && !unused->second.empty()) {
-            auto& unusedList = unused->second;
-            auto set = unusedList.back();
-            unusedList.pop_back();
-            mCount++;
+    // A convenience method for checking if this pool can allocate sets for a given layout.
+    inline bool canAllocate(VulkanDescriptorSetLayout* layout) {
+        return DescriptorCount::fromLayoutBitmask(layout->bitmask) == mCount;
+    }
+
+    Handle<VulkanDescriptorSet> obtainSet() {
+        if (!mUnused.empty()) {
+            auto set = mUnused.back();
+            mUnused.pop_back();
+            mSize++;
             return set;
+        }
+        if (mSize + 1 > mCapacity) {
+            // This is the equivalent of returning null.
+            return Handle<VulkanDescriptorSet>();
         }
 
         // Creating a new set
-        VkDescriptorSetLayout layouts[1] = {layout};
+        VkDescriptorSetLayout layouts[1] = {mVkLayout};
         VkDescriptorSetAllocateInfo allocInfo = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
             .descriptorPool = mPool,
             .descriptorSetCount = 1,
             .pSetLayouts = layouts,
         };
         VkDescriptorSet vkSet;
         UTILS_UNUSED VkResult result = vkAllocateDescriptorSets(mDevice, &allocInfo, &vkSet);
-        ASSERT_POSTCONDITION(result == VK_SUCCESS, "Cannot allocate descriptor set. error=%d",
-                (int) result);
-
-        mCount++;
-        return createSet(layout, vkSet);
+        ASSERT_POSTCONDITION(result == VK_SUCCESS, "Failed to allocate descriptor set code=%d",
+                result);
+        mSize++;
+        return createSet(vkSet);
     }
 
 private:
-    inline VulkanDescriptorSet* createSet(VkDescriptorSetLayout layout, VkDescriptorSet vkSet) {
-        return VulkanDescriptorSet::create(mResourceAllocator, vkSet, layout,
-                [this](VulkanDescriptorSet* set) {
-                    auto const layout = set->layout;
-                    auto const vkSet = set->vkSet;
-                    auto listIter = mUnused.find(layout);
-                    assert_invariant(listIter != mUnused.end());
-                    auto& unusedList = listIter->second;
-
-                    // At this point, we know that the pointer will be stale, and we need to remove
-                    // any non-ref-counted references to it.
-                    // TODO: this will be inefficient
-                    auto iter = std::find(unusedList.begin(), unusedList.end(), set);
-                    unusedList.erase(iter);
-
-                    // We are recycling - release the vk resource back into the pool. Note that the
-                    // vk handle has not changed, but we need to change the backend handle to allow
-                    // for proper refcounting of resources referenced in this set.
-                    unusedList.push_back(createSet(layout, vkSet));
-                    mCount--;
-                });
+    Handle<VulkanDescriptorSet> createSet(VkDescriptorSet vkSet) {
+        return mAllocator->initHandle<VulkanDescriptorSet>(vkSet, [this, vkSet]() {
+            // We are recycling - release the vk resource back into the pool. Note that the
+            // vk handle has not changed, but we need to change the backend handle to allow
+            // for proper refcounting of resources referenced in this set.
+            mUnused.push_back(createSet(vkSet));
+            mSize--;
+        });
     }
 
     VkDevice mDevice;
-    VulkanResourceAllocator* mResourceAllocator;
+    VulkanResourceAllocator* mAllocator;
     VkDescriptorPool mPool;
+    VkDescriptorSetLayout mVkLayout;
+    Count mCount;
+    uint16_t const mCapacity;
 
-    uint32_t mCount = 0;
-    std::unordered_map<VkDescriptorSetLayout, std::vector<VulkanDescriptorSet*>> mUnused;
+    // This tracks that currently the number of in-use descriptor sets.
+    uint16_t mSize;
+
+    // This maps a layout ot a list of descriptor sets allocated for that layout.
+    std::vector<Handle<VulkanDescriptorSet>> mUnused;
 };
 
-template<typename TYPE>
 class DescriptorInfinitePool {
+private:
+    static constexpr uint16_t EXPECTED_SET_COUNT = 10;
+    static constexpr float SET_COUNT_GROWTH_FACTOR = 1.5;
 public:
     DescriptorInfinitePool(VkDevice device, VulkanResourceAllocator* allocator)
         : mDevice(device),
           mResourceAllocator(allocator) {}
 
-    ~DescriptorInfinitePool() {
-        for (auto pool: mPools) {
-            delete pool;
-        }
-    }
-
-    VulkanDescriptorSet* obtainSet(VkDescriptorSetLayout layout) {
-        for (auto pool: mPools) {
-            auto set = pool->obtainSet(layout);
-            if (set) {
+    Handle<VulkanDescriptorSet> obtainSet(VulkanDescriptorSetLayout* layout) {
+        DescriptorPool* sameTypePool = nullptr;
+        for (auto& pool: mPools) {
+            if (!pool->canAllocate(layout)) {
+                continue;
+            }
+            if (auto set = pool->obtainSet(); set) {
                 return set;
             }
+            if (!sameTypePool || sameTypePool->capacity() < pool->capacity()) {
+                sameTypePool = pool.get();
+            }
         }
-        // We need to increase the number of pools
-        mPools.push_back(new DescriptorPool<TYPE>{mDevice, mResourceAllocator});
-        auto pool = mPools.back();
-        return pool->obtainSet(layout);
+
+        uint16_t capacity = EXPECTED_SET_COUNT;
+        if (sameTypePool) {
+            // Exponentially increase the size of the pool  to ensure we don't hit this too often.
+            capacity = std::ceil(sameTypePool->capacity() * SET_COUNT_GROWTH_FACTOR);
+        }
+
+        // We need to increase the set of pools by one.
+        mPools.push_back(
+                std::make_unique<DescriptorPool>(mDevice, mResourceAllocator, layout, capacity));
+        auto& pool = mPools.back();
+        return pool->obtainSet();
     }
 
 private:
     VkDevice mDevice;
     VulkanResourceAllocator* mResourceAllocator;
-    std::vector<DescriptorPool<TYPE>*> mPools;
+    std::vector<std::unique_ptr<DescriptorPool>> mPools;
 };
 
-// This holds a cache of descriptor sets of a TYPE (UBO or Sampler). The Key is defined as the
-// layout and the content (for example specific samplers).
-template<typename TYPE, typename Cache, typename Key>
-class DescriptorSetCache {
-public:
-    DescriptorSetCache(VkDevice device, VulkanResourceAllocator* allocator)
-        : mPool(device, allocator),
-          mResourceManager(allocator) {}
-
-    std::pair<VulkanDescriptorSet*, bool> obtainSet(Key const& key) {
-        mAge++;
-        if (auto result = mCache.find(key); result != mCache.end()) {
-            auto set = result->second;
-            auto const oldAge = mReverseHistory[set];
-            mHistory.erase(oldAge);
-            mHistory[mAge] = set;
-            mReverseHistory[set] = mAge;
-            return {set, true};
-        }
-
-        VulkanDescriptorSet* set = mPool.obtainSet(key.layout);
-        mCache[key] = set;
-        mReverseCache[set] = key;
-        mHistory[mAge] = set;
-        mReverseHistory[set] = mAge;
-        mResourceManager.acquire(set);
-        return {set, false};
-    }
-
-    // We need to periodically purge the descriptor sets so that we're not holding on to resources
-    // unnecessarily. The strategy for purging needs to be examined more.
-    void gc() noexcept {
-        constexpr uint32_t ALLOWED_ENTRIES = EXPECTED_IN_FLIGHT_FRAMES * 3;
-        int32_t const toCutCount = mHistory.size() - ALLOWED_ENTRIES;
-
-        if (toCutCount <= 0) {
-            return;
-        }
-
-        std::vector<uint64_t> remove;
-        for (auto entry = mHistory.begin(); entry != mHistory.end(); entry++) {
-            auto const& set = entry->second;
-            Key const& key = mReverseCache[set];
-            mCache.erase(key);
-            mReverseCache.erase(set);
-            mReverseHistory.erase(set);
-
-            remove.push_back(entry->first);
-            mResourceManager.release(set);
-        }
-        for (auto removeAge: remove) {
-            mHistory.erase(removeAge);
-        }
-    }
-
-private:
-    DescriptorInfinitePool<TYPE> mPool;
-
-    // TODO: combine some of these data structures
-    Cache mCache;
-    std::unordered_map<VulkanDescriptorSet*, Key> mReverseCache;
-
-    // Use the ordering for purging if needed;
-    std::map<uint64_t, VulkanDescriptorSet*> mHistory;
-    std::unordered_map<VulkanDescriptorSet*, uint64_t> mReverseHistory;
-    uint64_t mAge;
-
-    // Note that instead of owning the resources (i.e. descriptor set) in the pools, we keep them
-    // here since all the allocated sets have to pass through this class, and this class has better
-    // knowledge to make decisions about gc.
-    VulkanResourceManager mResourceManager;
-};
-
-using UBOSetCache = DescriptorSetCache<UBOSet, UBOSet::Cache, UBOSet::Key>;
-using SamplerSetCache = DescriptorSetCache<SamplerSet, SamplerSet::Cache, SamplerSet::Key>;
-
-template<typename MaskType>
 class LayoutCache {
+private:
+    using Key = VulkanDescriptorSetLayout::Bitmask;
+
+    // Make sure the key is 8-bytes aligned.
+    static_assert(sizeof(Key) % 8 == 0);
+
+    struct Equal {
+        bool operator()(Key const& k1, Key const& k2) const {
+            return 0 == memcmp((const void*) &k1, (const void*) &k2, sizeof(Key));
+        }
+    };
+
+    using HashFn = utils::hash::MurmurHashFn<Key>;
+    using LayoutMap = std::unordered_map<Key, Handle<VulkanDescriptorSetLayout>, HashFn, Equal>;
+
 public:
-    explicit LayoutCache(VkDevice device)
-        : mDevice(device) {}
+    explicit LayoutCache(VkDevice device, VulkanResourceAllocator* allocator)
+        : mDevice(device),
+          mAllocator(allocator) {}
 
     ~LayoutCache() {
-        for (auto [mask, layout]: mLayouts) {
-            vkDestroyDescriptorSetLayout(mDevice, layout, VKALLOC);
+        for (auto [key, layout]: mLayouts) {
+            auto layoutPtr = mAllocator->handle_cast<VulkanDescriptorSetLayout*>(layout);
+            vkDestroyDescriptorSetLayout(mDevice, layoutPtr->vklayout, VKALLOC);
         }
         mLayouts.clear();
     }
 
-    VkDescriptorSetLayout getLayout(MaskType stageMask) noexcept {
-        if (stageMask == 0) {
-            return VK_NULL_HANDLE;
+    void destroyLayout(Handle<VulkanDescriptorSetLayout> handle) {
+        auto layoutPtr = mAllocator->handle_cast<VulkanDescriptorSetLayout*>(handle);
+        for (auto [key, layout]: mLayouts) {
+            if (layout == handle) {
+                mLayouts.erase(key);
+                break;
+            }
         }
-        if (auto iter = mLayouts.find(stageMask); iter != mLayouts.end()) {
+        vkDestroyDescriptorSetLayout(mDevice, layoutPtr->vklayout, VKALLOC);
+    }
+
+    Handle<VulkanDescriptorSetLayout> getLayout(descset::DescriptorSetLayout const& layout) {
+        Key key = Key::fromBackendLayout(layout);
+        if (auto iter = mLayouts.find(key); iter != mLayouts.end()) {
             return iter->second;
-        }
-        VkDescriptorType descriptorType;
-        if constexpr (std::is_same_v<MaskType, UBOSet::Mask>) {
-            descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        } else if constexpr (std::is_same_v<MaskType, SamplerSet::Mask>) {
-            descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         }
 
         VkDescriptorSetLayoutBinding toBind[MAX_BINDINGS];
         uint32_t count = 0;
-        for (uint8_t i = 0, maxBindings = sizeof(stageMask) * 4; i < maxBindings; i++) {
-            VkShaderStageFlags stages = 0;
-            if ((stageMask & (VERTEX_STAGE << i)) != 0) {
+        for (auto const& binding: layout.bindings) {
+            auto& bindInfo = toBind[count];
+            bindInfo.binding = binding.binding;
+            bindInfo.descriptorCount = 1;
+            auto& stages = bindInfo.stageFlags;
+            auto& type = bindInfo.descriptorType;
+
+            if (binding.stageFlags & descset::ShaderStageFlags2::VERTEX) {
                 stages |= VK_SHADER_STAGE_VERTEX_BIT;
             }
-            if ((stageMask & (FRAGMENT_STAGE << i)) == 0) {
+            if (binding.stageFlags & descset::ShaderStageFlags2::FRAGMENT) {
                 stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
             }
-            if (stages == 0) {
-                continue;
+            switch (binding.type) {
+                case descset::DescriptorType::UNIFORM_BUFFER: {
+                    type = binding.flags == descset::DescriptorFlags::DYNAMIC_OFFSET ?
+                            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC :
+                            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                    break;
+                }
+                case descset::DescriptorType::SAMPLER: {
+                    type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    break;
+                }
+                case descset::DescriptorType::INPUT_ATTACHMENT: {
+                    type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+                    break;
+                }
             }
-
-            auto& bindInfo = toBind[count++];
-            bindInfo = {
-                .binding = i,
-                .descriptorType = descriptorType,
-                .descriptorCount = 1,
-                .stageFlags = stages,
-            };
+            count++;
         }
+
         VkDescriptorSetLayoutCreateInfo dlinfo = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
             .bindingCount = count,
             .pBindings = toBind,
         };
 
-        VkDescriptorSetLayout handle;
-        vkCreateDescriptorSetLayout(mDevice, &dlinfo, VKALLOC, &handle);
-        mLayouts[stageMask] = handle;
-
+        VkDescriptorSetLayout outLayout;
+        vkCreateDescriptorSetLayout(mDevice, &dlinfo, VKALLOC, &outLayout);
+        auto handle = mLayouts[key] = mAllocator->initHandle<VulkanDescriptorSetLayout>(outLayout);
         return handle;
     }
 
 private:
     VkDevice mDevice;
-    LayoutMap<MaskType> mLayouts;
+    VulkanResourceAllocator* mAllocator;
+    LayoutMap mLayouts;
 };
 
-using UBOSetLayoutCache = LayoutCache<UBOSet::Mask>;
-using SamplerSetLayoutCache = LayoutCache<SamplerSet::Mask>;
+}// anonymous namespace
 
-} // anonymous namespace
-
-VulkanDescriptorSet::VulkanDescriptorSet(VulkanResourceAllocator* allocator, VkDescriptorSet rawSet,
-        VkDescriptorSetLayout layout, OnRecycle&& onRecycleFn)
-    : VulkanResource(VulkanResourceType::DESCRIPTOR_SET),
-      resources(allocator),
-      vkSet(rawSet),
-      layout(layout),
-      mOnRecycleFn(std::move(onRecycleFn)) {}
-
-VulkanDescriptorSet::~VulkanDescriptorSet() {
-    if (mOnRecycleFn) {
-        mOnRecycleFn(this);
-    }
-}
-
-VulkanDescriptorSet* VulkanDescriptorSet::create(VulkanResourceAllocator* allocator,
-        VkDescriptorSet rawSet, VkDescriptorSetLayout layout, OnRecycle&& onRecycleFn) {
-    auto handle = allocator->allocHandle<VulkanDescriptorSet>();
-    auto set = allocator->construct<VulkanDescriptorSet>(handle, allocator, rawSet, layout,
-            std::move(onRecycleFn));
-    return set;
-}
 
 class VulkanDescriptorSetManager::Impl {
+private:
+    using UBOMap = std::unordered_map<uint8_t, std::pair<VkDescriptorBufferInfo, VulkanBufferObject*>>;
+    using SamplerMap = std::unordered_map<uint8_t, std::pair<VkDescriptorImageInfo, VulkanTexture*>>;
+    using VulkanDescriptorSetLayoutList = VulkanDescriptorSetManager::VulkanDescriptorSetLayoutList;
+    using GetPipelineLayoutFunction = VulkanDescriptorSetManager::GetPipelineLayoutFunction;
+
+    struct BoundState {
+        VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
+        VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+        VulkanDescriptorSet* set = nullptr;
+        VulkanDescriptorSetLayoutList layouts;
+
+        inline bool operator==(BoundState const& b) const {
+            return set == b.set && cmdbuf == b.cmdbuf && pipelineLayout == b.pipelineLayout;
+        }
+
+        inline bool operator!=(BoundState const& b) const { return !(*this == b); }
+
+        inline bool valid() {
+            return cmdbuf != VK_NULL_HANDLE;
+        }
+    };
+    
+    static constexpr uint8_t UBO_SET_ID = 0;
+    static constexpr uint8_t SAMPLER_SET_ID = 1;
+    static constexpr uint8_t INPUT_ATTACHMENT_SET_ID = 2;
+    
 public:
     Impl(VkDevice device, VulkanResourceAllocator* allocator)
         : mDevice(device),
-          mUBOLayoutCache(device),
-          mUBOCache(device, allocator),
-          mSamplerLayoutCache(device),
-          mSamplerCache(device, allocator),
+          mAllocator(allocator),
+          mLayoutCache(device, allocator),
+          mDescriptorPool(device, allocator),
+          mHaveDynamicUbos(false),
           mResources(allocator) {}
 
-    void setUniformBufferObject(uint32_t bindingIndex, VulkanBufferObject* bufferObject,
-            VkDeviceSize offset, VkDeviceSize size) noexcept {
-        mUbos.push_back({bindingIndex, bufferObject, offset, size});
+    // This will write/update/bind all of the descriptor set.
+    // When bind() is called, that's when the descriptor sets are allocated and then updated. This
+    // behavior will change after the [UPCOMING CHANGE] completes.
+    VkPipelineLayout bind(VulkanCommandBuffer* commands,
+            VulkanDescriptorSetLayoutList const& layouts,
+            GetPipelineLayoutFunction& getPipelineLayoutFn) {
+        using DescriptorSetHandles =
+                std::array<VkDescriptorSet, VulkanDescriptorSetManager::UNIQUE_DESCRIPOR_SET_COUNT>;
 
-        // Between "set" and "commit", we need to ref the buffer object to avoid it being collected.
-        mResources.acquire(bufferObject);
-    }
-
-    void setSamplers(SamplerArray&& samplers) {
-        mSamplers = std::move(samplers);
-        for (auto const& sampler: mSamplers) {
-            mResources.acquire(sampler.texture);
-        }
-    }
-
-    void gc() noexcept {
-        mUBOCache.gc();
-        mSamplerCache.gc();
-    }
-
-    // This will write/update all of the descriptor set (and create a set if a one of the same
-    // layout is not available).
-    void bind(VulkanCommandBuffer* commands, GetPipelineLayoutFunction& getPipelineLayoutFn) {
-        LayoutArray layouts = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-        std::array<VkDescriptorSet, 2> descSets = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+        DescriptorSetHandles descSets {VK_NULL_HANDLE};
         uint8_t descSetCount = 0;
 
-        VkWriteDescriptorSet descriptorWrites[UNIFORM_BINDING_COUNT + SAMPLER_BINDING_COUNT];
-        VkDescriptorBufferInfo uboWrite[UNIFORM_BINDING_COUNT];
-        VkDescriptorImageInfo samplerWrite[SAMPLER_BINDING_COUNT];
+        VkWriteDescriptorSet descriptorWrites[MAX_BINDINGS];
         uint32_t nwrites = 0;
 
-        UBOSet::Key uboKey = {};
-        auto& uboMask = uboKey.mask;
-        uint8_t uboCount = 0;
-        for (auto const& ubo: mUbos) {
-            auto const& binding = std::get<0>(ubo);
-
-            uboKey.buffers[uboCount] = std::get<1>(ubo)->buffer.getGpuBuffer();
-            uboKey.offsets[uboCount] = std::get<2>(ubo);
-            uboKey.sizes[uboCount] = std::get<3>(ubo);
-            uboCount++;
-
-            // Currently we let ubo be visible in all stages.
-            uboMask |= (VERTEX_STAGE << binding);
-            uboMask |= (FRAGMENT_STAGE << binding);
+        for (uint8_t i = 0; i < UNIQUE_DESCRIPOR_SET_COUNT; ++i) {
+            auto handle = layouts[i];
+            if (!handle) {
+                continue;
+            }
+            switch (i) {
+                case UBO_SET_ID:
+                    break;                    
+                case SAMPLER_SET_ID:
+                    break;
+                case INPUT_ATTACHMENT_SET_ID:
+                    break;
+            }
+            auto layout = mAllocator->handle_cast<VulkanDescriptorSetLayout*>(handle);
+            
         }
+        
+        auto const& uboMask = layout.ubo;
+        auto const& samplerMask = layout.sampler;
+
 
         if (uboMask) {
-            layouts[UBO_SET_INDEX] = uboKey.layout = mUBOLayoutCache.getLayout(uboMask);
+            auto [descriptorSet, vkset, vklayout, writes] =
+                writeUbos(uboMask, descriptorWrites, uboWrite, nwrites);
 
-            auto [descriptorSet, cached] = mUBOCache.obtainSet(uboKey);
-            descSets[descSetCount++] = descriptorSet->vkSet;
-
-            // We need to write to the descriptor set since it wasn't cached.
-            if (!cached) {
-                // If it wasn't cached before, we need to ref the resources that it touches.
-                for (auto const& ubo: mUbos) {
-                    auto const buffer = std::get<1>(ubo);
-                    descriptorSet->resources.acquire(buffer);
-                }
-
-                for (uint8_t i = 0; i < uboCount; ++i) {
-                    auto const& binding = std::get<0>(mUbos[i]);
-                    VkWriteDescriptorSet& descriptorWrite = descriptorWrites[nwrites++];
-                    auto& writeInfo = uboWrite[i];
-                    writeInfo = {
-                        .buffer = uboKey.buffers[i],
-                        .offset = uboKey.offsets[i],
-                        .range = uboKey.sizes[i],
-                    };
-                    descriptorWrite = {
-                        .dstSet = descriptorSet->vkSet,
-                        .dstBinding = binding,
-                        .descriptorCount = 1,
-                        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                        .pBufferInfo = &writeInfo,
-                    };
-                }
-            }
+            nwrites = writes;
+            descSets[descSetCount++] = vkset;
             commands->acquire(descriptorSet);
         }
 
-        SamplerSet::Key samplerKey = {};
-        auto& samplerMask = samplerKey.mask;
-        uint8_t samplerCount = 0;
-        for (auto const sampler: mSamplers) {
-            samplerMask |= (sampler.stage << sampler.binding);
 
-            samplerKey.sampler[samplerCount] = sampler.info.sampler;
-            samplerKey.imageView[samplerCount] = sampler.info.imageView;
-            samplerKey.imageLayout[samplerCount] = sampler.info.imageLayout;
-            samplerCount++;
-        }
-
-        if (samplerMask) {
-            layouts[SAMPLER_SET_INDEX] = samplerKey.layout =
-                    mSamplerLayoutCache.getLayout(samplerMask);
-
-            auto [descriptorSet, cached] = mSamplerCache.obtainSet(samplerKey);
-            descSets[descSetCount++] = descriptorSet->vkSet;
-
-            if (!cached) {
-                for (auto const& sampler: mSamplers) {
-                    descriptorSet->resources.acquire(sampler.texture);
-                }
-
-                for (uint8_t i = 0; i < samplerCount; ++i) {
-                    auto const& binding = mSamplers[i].binding;
-                    VkWriteDescriptorSet& descriptorWrite = descriptorWrites[nwrites++];
-                    auto& writeInfo = samplerWrite[i];
-                    writeInfo = mSamplers[i].info;
-                    descriptorWrite = {
-                        .dstSet = descriptorSet->vkSet,
-                        .dstBinding = binding,
-                        .descriptorCount = 1,
-                        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                        .pImageInfo = &writeInfo,
-                    };
-                }
-            }
-            commands->acquire(descriptorSet);
-        }
         if (nwrites) {
             vkUpdateDescriptorSets(mDevice, nwrites, descriptorWrites, 0, nullptr);
         }
 
         VkPipelineLayout const pipelineLayout = getPipelineLayoutFn(layouts);
+
+
         VkCommandBuffer const cmdbuffer = commands->buffer();
 
         BoundState state {
             .cmdbuf = cmdbuffer,
             .pipelineLayout = pipelineLayout,
+            .handles = descSets,
+            .uboMask = uboMask,
         };
 
-        if (state == mPreviousBoundState) {
+        if (state != mBoundState) {
+            vkCmdBindDescriptorSets(cmdbuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
+                    descSetCount, descSets.data(), 0, nullptr);
+            mBoundState = state;
+        }
+
+        // Once bound, the resources are now ref'd in the descriptor set and the some resources can
+        // be released and the descriptor set is ref'd by the command buffer.
+        for (auto const& [binding, samplerBundle]: mSamplerMap) {
+            auto const& [info, texture] = samplerBundle;
+            mResources.release(texture);
+        }
+        mSamplerMap.clear();
+        mInputAttachment = {};
+
+        return pipelineLayout;
+    }
+
+    void dynamicBind(VulkanCommandBuffer* commands) {
+        if (!mHaveDynamicUbos) {
+            return;
+        }
+        assert_invariant(mBoundState.valid());
+
+        VkWriteDescriptorSet descriptorWrites[MAX_UBO_BINDING];
+        VkDescriptorBufferInfo uboWrite[MAX_UBO_BINDING];
+
+        auto [descriptorSet, vkset, vklayout, nwrites] =
+                writeUbos(mBoundState.uboMask, descriptorWrites, uboWrite, 0);
+
+        if (nwrites == 0) {
             return;
         }
 
-        vkCmdBindDescriptorSets(cmdbuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
-                descSetCount, descSets.data(), 0, nullptr);
+        commands->acquire(descriptorSet);
 
-        mPreviousBoundState = state;
+        vkUpdateDescriptorSets(mDevice, nwrites, descriptorWrites, 0, nullptr);
 
-        // Once bound, the resources are now ref'd in the descriptor set and the references in this
-        // class can be released and the descriptor set is ref'd by the command buffer.
-        mResources.clear();
+        // Only bind the UBO set
+        vkCmdBindDescriptorSets(mBoundState.cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                mBoundState.pipelineLayout, 0, 1, &vkset, 0, nullptr);
+
+        mHaveDynamicUbos = false;
+    }
+
+    Handle<VulkanDescriptorSetLayout> createLayout(descset::DescriptorSetLayout const& description) {
+        return mLayoutCache.getLayout(description);
+    }
+
+    void destroyLayout(Handle<VulkanDescriptorSetLayout> layout) {
+        mLayoutCache.destroyLayout(layout);
+    }
+
+    // Note that before [UPCOMING CHANGE] arrives, the "update" methods stash state within this
+    // class and is not actually working with respect to a descriptor set.
+    void updateBuffer(Handle<VulkanDescriptorSet>, uint8_t binding,
+            VulkanBufferObject* bufferObject, VkDeviceSize offset, VkDeviceSize size) noexcept {
+        VkDescriptorBufferInfo const info {
+                .buffer = bufferObject->buffer.getGpuBuffer(),
+                .offset = offset,
+                .range = size,
+        };
+        mUboMap[binding] = {info, bufferObject};
+        mResources.acquire(bufferObject);
+
+        if (mHaveDynamicUbos && mBoundState.valid()) {
+            mHaveDynamicUbos = true;
+        }
+    }
+
+    void updateSampler(Handle<VulkanDescriptorSet>, uint8_t binding,
+            VulkanTexture* texture, VkSampler sampler) noexcept {
+        VkDescriptorImageInfo info {
+                .sampler = sampler,
+        };
+        VkImageSubresourceRange const range = texture->getPrimaryViewRange();
+        VkImageViewType const expectedType = texture->getViewType();
+        if (any(texture->usage & TextureUsage::DEPTH_ATTACHMENT) &&
+                expectedType == VK_IMAGE_VIEW_TYPE_2D) {
+            // If the sampler is part of a mipmapped depth texture, where one of the level *can* be
+            // an attachment, then the sampler for this texture has the same view properties as a
+            // view for an attachment. Therefore, we can use getAttachmentView to get a
+            // corresponding VkImageView.
+            info.imageView = texture->getAttachmentView(range);
+        } else {
+            info.imageView = texture->getViewForType(range, expectedType);
+        }
+        info.imageLayout = ImgUtil::getVkLayout(texture->getPrimaryImageLayout());
+        mSamplerMap[binding] = {info, texture};
+        mResources.acquire(texture);
+    }
+
+    void updateInputAttachment(Handle<VulkanDescriptorSet>,
+            VulkanAttachment attachment) noexcept {
+        mInputAttachment = attachment;
+        mResources.acquire(mInputAttachment.texture);
+    }
+
+    void clearBuffer(uint32_t binding) {
+        if (auto itr = mUboMap.find(binding); itr != mUboMap.end()) {
+            auto& [info, uboPtr] = itr->second;
+            mResources.release(uboPtr);
+            mUboMap.erase(itr);
+        }
+    }
+
+    void setPlaceHolders(VkSampler sampler, VulkanTexture* texture,
+            VulkanBufferObject* bufferObject) noexcept {
+        mPlaceHolderSampler = sampler;
+        mPlaceHolderTexture = texture;
+        mPlaceHolderObject = bufferObject;
+    }
+
+    void clearState() noexcept {
+        mHaveDynamicUbos = false;
+        mInputAttachment = {};
+        mResources.release(mInputAttachment.texture);
     }
 
 private:
-    struct BoundState {
-        VkCommandBuffer cmdbuf;
-        VkPipelineLayout pipelineLayout;
 
-        bool operator==(BoundState const& b) const {
-            return cmdbuf == b.cmdbuf && pipelineLayout == b.pipelineLayout;
-        }
-    };
+    void writeUbos(UniformBufferBitmask const& uboMask, VkWriteDescriptorSet* descriptorWrites,
+            VkDescriptorBufferInfo* uboWrite, uint32_t nwrites) {
+    }
 
     VkDevice mDevice;
+    VulkanResourceAllocator* mAllocator;
+    LayoutCache mLayoutCache;
+    DescriptorInfinitePool mDescriptorPool;
+    bool mHaveDynamicUbos;
 
-    UBOSetLayoutCache mUBOLayoutCache;
-    UBOSetCache mUBOCache;
+    UBOMap mUboMap;
+    SamplerMap mSamplerMap;
+    VulkanAttachment mInputAttachment;
 
-    SamplerSetLayoutCache mSamplerLayoutCache;
-    SamplerSetCache mSamplerCache;
+    VulkanResourceManager mResources;
 
-    std::vector<std::tuple<uint32_t, VulkanBufferObject*, VkDeviceSize, VkDeviceSize>> mUbos;
-    SamplerArray mSamplers;
-    VulkanAcquireOnlyResourceManager mResources;
+    VkSampler mPlaceHolderSampler;
+    VulkanTexture* mPlaceHolderTexture;
+    VulkanBufferObject* mPlaceHolderObject;
 
-    BoundState mPreviousBoundState;
+    BoundState mBoundState;
 };
 
 VulkanDescriptorSetManager::VulkanDescriptorSetManager(VkDevice device,
@@ -628,20 +614,51 @@ void VulkanDescriptorSetManager::terminate() noexcept {
     mImpl = nullptr;
 }
 
-void VulkanDescriptorSetManager::gc() noexcept { mImpl->gc(); }
-
-void VulkanDescriptorSetManager::bind(VulkanCommandBuffer* commands,
-        GetPipelineLayoutFunction& getPipelineLayoutFn) {
-    mImpl->bind(commands, getPipelineLayoutFn);
+// This will write/update/bind all of the descriptor set.
+VkPipelineLayout VulkanDescriptorSetManager::bind(VulkanCommandBuffer* commands,
+        VulkanDescriptorSetManager::VulkanDescriptorSetLayoutList const& layouts,
+        VulkanDescriptorSetManager::GetPipelineLayoutFunction& getPipelineLayoutFn) {
+    return mImpl->bind(commands, layouts, getPipelineLayoutFn);
 }
 
-void VulkanDescriptorSetManager::setUniformBufferObject(uint32_t bindingIndex,
-        VulkanBufferObject* bufferObject, VkDeviceSize offset, VkDeviceSize size) noexcept {
-    mImpl->setUniformBufferObject(bindingIndex, bufferObject, offset, size);
+void VulkanDescriptorSetManager::dynamicBind(VulkanCommandBuffer* commands, Handle<VulkanDescriptorSetLayout> uboLayout) {
+    mImpl->dynamicBind(commands);
 }
 
-void VulkanDescriptorSetManager::setSamplers(SamplerArray&& samplers) {
-    mImpl->setSamplers(std::move(samplers));
+Handle<VulkanDescriptorSetLayout> VulkanDescriptorSetManager::createLayout(
+        descset::DescriptorSetLayout const& layout) {
+    return mImpl->createLayout(layout);
 }
 
-} // namespace filament::backend
+void VulkanDescriptorSetManager::destroyLayout(Handle<VulkanDescriptorSetLayout> layout) {
+    mImpl->destroyLayout(layout);
+}
+
+void VulkanDescriptorSetManager::updateBuffer(Handle<VulkanDescriptorSet> set,
+        uint8_t binding, VulkanBufferObject* bufferObject, VkDeviceSize offset,
+        VkDeviceSize size) noexcept {
+    mImpl->updateBuffer(set, binding, bufferObject, offset, size);
+}
+
+void VulkanDescriptorSetManager::updateSampler(Handle<VulkanDescriptorSet> set,
+        uint8_t binding, VulkanTexture* texture, VkSampler sampler) noexcept {
+    mImpl->updateSampler(set, binding, texture, sampler);
+}
+
+void VulkanDescriptorSetManager::updateInputAttachment(Handle<VulkanDescriptorSet> set, VulkanAttachment attachment) noexcept {
+    mImpl->updateInputAttachment(set, attachment);
+}
+
+void VulkanDescriptorSetManager::clearBuffer(uint32_t bindingIndex) {
+    mImpl->clearBuffer(bindingIndex);
+}
+
+void VulkanDescriptorSetManager::setPlaceHolders(VkSampler sampler, VulkanTexture* texture,
+        VulkanBufferObject* bufferObject) noexcept {
+    mImpl->setPlaceHolders(sampler, texture, bufferObject);
+}
+
+void VulkanDescriptorSetManager::clearState() noexcept { mImpl->clearState(); }
+
+
+}// namespace filament::backend

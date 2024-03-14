@@ -49,8 +49,8 @@ namespace filament::backend {
 #endif
 
 class VulkanResourceAllocator {
-
 public:
+    using AllocatorImpl = HandleAllocatorVK;
     VulkanResourceAllocator(size_t arenaSize)
         : mHandleAllocatorImpl("Handles", arenaSize)
 #if DEBUG_RESOURCE_LEAKS
@@ -106,16 +106,16 @@ public:
     }
 
 private:
-    HandleAllocatorVK mHandleAllocatorImpl;
+    AllocatorImpl mHandleAllocatorImpl;
 
 #if DEBUG_RESOURCE_LEAKS
 public:
     void print() {
-        utils::slog.d << "Resource Allocator state (debug only)" << utils::io::endl;
+        utils::slog.e << "Resource Allocator state (debug only)" << utils::io::endl;
         for (size_t i = 0; i < RESOURCE_TYPE_COUNT; i++) {
-            utils::slog.d << "[" << i << "]=" << mDebugOnlyResourceCount[i] << utils::io::endl;
+            utils::slog.e << "[" << i << "]=" << mDebugOnlyResourceCount[i] << utils::io::endl;
         }
-        utils::slog.d << "+++++++++++++++++++++++++++++++++++++" << utils::io::endl;
+        utils::slog.e << "+++++++++++++++++++++++++++++++++++++" << utils::io::endl;
     }
 private:
     utils::FixedCapacityVector<size_t> mDebugOnlyResourceCount;

@@ -20,6 +20,7 @@
 #include "VulkanConstants.h"
 #include "VulkanDriver.h"
 #include "VulkanMemory.h"
+#include "VulkanUtility.h"
 #include "spirv/VulkanSpirvUtils.h"
 
 #include <backend/platforms/VulkanPlatform.h>
@@ -30,15 +31,17 @@ using namespace bluevk;
 
 namespace filament::backend {
 
-static void flipVertically(VkRect2D* rect, uint32_t framebufferHeight) {
+namespace {
+
+void flipVertically(VkRect2D* rect, uint32_t framebufferHeight) {
     rect->offset.y = framebufferHeight - rect->offset.y - rect->extent.height;
 }
 
-static void flipVertically(VkViewport* rect, uint32_t framebufferHeight) {
+void flipVertically(VkViewport* rect, uint32_t framebufferHeight) {
     rect->y = framebufferHeight - rect->y - rect->height;
 }
 
-static void clampToFramebuffer(VkRect2D* rect, uint32_t fbWidth, uint32_t fbHeight) {
+void clampToFramebuffer(VkRect2D* rect, uint32_t fbWidth, uint32_t fbHeight) {
     int32_t x = std::max(rect->offset.x, 0);
     int32_t y = std::max(rect->offset.y, 0);
     int32_t right = std::min(rect->offset.x + (int32_t) rect->extent.width, (int32_t) fbWidth);
@@ -48,6 +51,68 @@ static void clampToFramebuffer(VkRect2D* rect, uint32_t fbWidth, uint32_t fbHeig
     rect->extent.width = std::max(right - x, 0);
     rect->extent.height = std::max(top - y, 0);
 }
+
+template<typename Bitmask>
+static constexpr Bitmask fromStageFlags(ShaderStageFlags2 flags, uint8_t binding) {
+    Bitmask ret;
+    if (flags & ShaderStageFlags2::VERTEX) {
+        ret |= (getVertexStage<Bitmask>() << binding);
+    }
+    if (flags & ShaderStageFlags2::FRAGMENT) {
+        ret |= (getFragmentStage<Bitmask>() << binding);
+    }
+    return ret;
+}
+
+
+template <typename T>
+std::string printx(T x) {
+    std::string o = "0x";
+    for (size_t i = 0; i < sizeof(x) * 8; ++i) {
+        if (i%16 == 0 && i > 0) o+="-";
+        if (x & (1 << i)) {
+            o+="1";
+        } else {
+            o+="0";
+        }
+    }
+    return o;
+}
+
+constexpr uint8_t UBO_MODULE_OFFSET = (sizeof(UniformBufferBitmask) * 8) / MAX_SHADER_MODULES;
+constexpr uint8_t SAMPLER_MODULE_OFFSET = (sizeof(SamplerBitmask) * 8) / MAX_SHADER_MODULES;
+constexpr uint8_t INPUT_ATTACHMENT_MODULE_OFFSET =
+        (sizeof(InputAttachmentBitmask) * 8) / MAX_SHADER_MODULES;
+
+template<typename Bitmask>
+void addDescriptors(Bitmask mask, LayoutDescriptionList& outputList) {
+    constexpr uint8_t MODULE_OFFSET + (sizeof(Bitmask) * 8) / MAX_SHADER_MODULES;
+    for (uint8_t i = 0; i < sizeof(Bitmask) / MAX_SHADER_MODULES; ++i) {
+        bool hasVertex = (mask & i) != 0;
+        bool hasFragment = (mask & (1 << MODULE_OFFSET)) != 0;
+        if (!hasVertex && !hasFragment) {
+            continue;
+        }
+
+        DescriptorSetLayoutBinding binding {
+            .stageFlags = (hasVertex ? ShaderStageFlags2::VERTEX : 0) |
+                          (hasFragment ? ShaderStageFlags2::Fragment : 0);
+            .binding = i, .flags = DescriptorFlags::NONE,
+            .count = 0,// This is always 0 for now as we pass the size of the UBOs in the Driver API
+                       // instead.
+        };
+
+        if constexpr (std::is_same_v<Bitmask, UniformBufferBitmask>) {
+            binding.type = DescriptorType::UNIFORM_BUFFER;
+        } else if constexpr (std::is_same_v<Bitmask, SamplerBitmask>) {
+            binding.type = DescriptorType::SAMPLER;
+        } else if constexpr (std::is_same_v<Bitmask, InputAttachmentBitmask>) {
+            binding.type = DescriptorType::INPUT_ATTACHMENT;
+        }
+        outputList.push_back(binding);
+    }
+
+} // anonymous namespace
 
 VulkanProgram::VulkanProgram(VkDevice device, Program const& builder) noexcept
     : HwProgram(builder.getName()),
@@ -60,6 +125,21 @@ VulkanProgram::VulkanProgram(VkDevice device, Program const& builder) noexcept
     auto const& specializationConstants = builder.getSpecializationConstants();
 
     std::vector<uint32_t> shader;
+
+    // TODO: this will be moved out of the shader as the descriptor set layout will be provided by
+    // Filament instead of parsed from the shaders.
+    UniformBufferBitmask uboMask;
+    SamplerBitmask samplerMask;
+    InputAttachmentBitmask inputAttachmentMask;
+
+    static_assert(static_cast<ShaderStage>(0) == ShaderStage::VERTEX &&
+            static_cast<ShaderStage>(1) == ShaderStage::FRAGMENT &&
+            MAX_SHADER_MODULES ==2);
+
+    // We use the counters to count the number of descriptors-per-type for sizing the Layout
+    // 'bindings'.
+    uint32_t uboCounter = 0, samplerCounter = 0, inputAttachmentCounter = 0;
+
     for (size_t i = 0; i < MAX_SHADER_MODULES; i++) {
         Program::ShaderBlob const& blob = blobs[i];
 
@@ -71,6 +151,15 @@ VulkanProgram::VulkanProgram(VkDevice device, Program const& builder) noexcept
             data = (uint32_t*) shader.data();
             dataSize = shader.size() * 4;
         }
+
+        auto const [ubo, sampler, inputAttachment] = getProgramBindings(blob);
+        uboCounter |= ubo;
+        samplerCounter |= sampler;
+        inputAttachmentCounter |= inputAttachment;
+        uboMask |= (static_cast<UniformBufferBitmask>(ubo) << (UBO_MODULE_OFFSET * i));
+        samplerMask |= (static_cast<SamplerBitmask>(sampler) << (SAMPLER_MODULE_OFFSET * i));
+        inputAttachmentMask |= (static_cast<InputAttachmentBitmask>(inputAttachment)
+                                << (INPUT_ATTACHMENT_MODULE_OFFSET * i));
 
         VkShaderModule& module = modules[i];
         VkShaderModuleCreateInfo moduleInfo = {
@@ -99,20 +188,24 @@ VulkanProgram::VulkanProgram(VkDevice device, Program const& builder) noexcept
 #endif
     }
 
+    size_t const totalDescriptors = BitCounter.count(uboCounter) + BitCounter.count(samplerCount) +
+                                    BitCounter.count(inputAttachmentCounter);
+
 #if FVK_ENABLED_DEBUG_SAMPLER_NAME
     auto& bindingToName = mInfo->bindingToName;
 #endif
 
     auto& groupInfo = builder.getSamplerGroupInfo();
     auto& bindingToSamplerIndex = mInfo->bindingToSamplerIndex;
-    auto& usage = mInfo->usage;
+    auto& bindings = mInfo->bindings;
     for (uint8_t groupInd = 0; groupInd < Program::SAMPLER_BINDING_COUNT; groupInd++) {
         auto const& group = groupInfo[groupInd];
         auto const& samplers = group.samplers;
         for (size_t i = 0; i < samplers.size(); ++i) {
             uint32_t const binding = samplers[i].binding;
             bindingToSamplerIndex[binding] = (groupInd << 8) | (0xff & i);
-            usage = VulkanPipelineCache::getUsageFlags(binding, group.stageFlags, usage);
+            assert_invariant(bindings.find(binding) == bindings.end());
+            bindings.insert(binding);
 
 #if FVK_ENABLED_DEBUG_SAMPLER_NAME
             bindingToName[binding] = samplers[i].name.c_str();
@@ -124,24 +217,6 @@ VulkanProgram::VulkanProgram(VkDevice device, Program const& builder) noexcept
     utils::slog.d << "Created VulkanProgram " << builder << ", shaders = (" << modules[0]
                   << ", " << modules[1] << ")" << utils::io::endl;
 #endif
-}
-
-VulkanProgram::VulkanProgram(VkDevice device, VkShaderModule vs, VkShaderModule fs,
-        CustomSamplerInfoList const& samplerInfo) noexcept
-    : VulkanResource(VulkanResourceType::PROGRAM),
-      mInfo(new PipelineInfo()),
-      mDevice(device) {
-    mInfo->shaders[0] = vs;
-    mInfo->shaders[1] = fs;
-    auto& bindingToSamplerIndex = mInfo->bindingToSamplerIndex;
-    auto& usage = mInfo->usage;
-    bindingToSamplerIndex.resize(samplerInfo.size());
-    for (uint16_t binding = 0; binding < samplerInfo.size(); ++binding) {
-        auto const& sampler = samplerInfo[binding];
-        bindingToSamplerIndex[binding]
-                = (sampler.groupIndex << 8) | (0xff & sampler.samplerIndex);
-        usage = VulkanPipelineCache::getUsageFlags(binding, sampler.flags, usage);
-    }
 }
 
 VulkanProgram::~VulkanProgram() {
@@ -404,5 +479,36 @@ VulkanRenderPrimitive::VulkanRenderPrimitive(VulkanResourceAllocator* resourceAl
     mResources.acquire(vertexBuffer);
     mResources.acquire(indexBuffer);
 }
+
+using Bitmask = VulkanDescriptorSetLayout::Bitmask;
+
+inline Bitmask Bitmask::fromBackendLayout(descset::DescriptorSetLayout const& layout) {
+    Bitmask mask;
+    for (auto const& binding: layout.bindings) {
+        switch (binding.type) {
+            case descset::DescriptorType::UNIFORM_BUFFER: {
+                if (binding.flags == descset::DescriptorFlags::DYNAMIC_OFFSET) {
+                    mask.dynamicUbo |= fromStageFlags<UniformBufferBitmask>(binding.stageFlags,
+                            binding.binding);
+                } else {
+                    mask.ubo |= fromStageFlags<UniformBufferBitmask>(binding.stageFlags,
+                            binding.binding);
+                }
+                break;
+            }
+            case descset::DescriptorType::SAMPLER: {
+                mask.sampler |= fromStageFlags<SamplerBitmask>(binding.stageFlags, binding.binding);
+                break;
+            }
+            case descset::DescriptorType::INPUT_ATTACHMENT: {
+                mask.inputAttachment |=
+                        fromStageFlags<InputAttachmentBitmask>(binding.stageFlags, binding.binding);
+                break;
+            }
+        }
+    }
+    return mask;
+}
+
 
 } // namespace filament::backend

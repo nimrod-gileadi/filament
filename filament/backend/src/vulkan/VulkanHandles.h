@@ -21,35 +21,51 @@
 #include "DriverBase.h"
 
 #include "VulkanBuffer.h"
-#include "VulkanPipelineCache.h"
 #include "VulkanResources.h"
 #include "VulkanSwapChain.h"
 #include "VulkanTexture.h"
+#include "VulkanUtility.h"
 
 #include "private/backend/SamplerGroup.h"
+#include "vulkan/vulkan_core.h"
 
 #include <utils/Mutex.h>
 #include <utils/StructureOfArrays.h>
 
 namespace filament::backend {
 
+using namespace descset;
+
 class VulkanTimestamps;
+
+struct VulkanDescriptorSetLayout : public VulkanResource {     
+    static constexpr uint8_t UNIQUE_DESCRIPOR_SET_COUNT = 3;
+     
+    // The bitmask representation of a set layout.
+    struct Bitmask {
+        UniformBufferBitmask ubo = 0;
+        UniformBufferBitmask dynamicUbo = 0;
+        SamplerBitmask sampler = 0;
+        InputAttachmentBitmask inputAttachment = 0;
+
+        static Bitmask fromBackendLayout(descset::DescriptorSetLayout const& layout);
+    };
+    
+    explicit VulkanDescriptorSetLayout(VkDescriptorSetLayout layout, Bitmask const& bitmask)
+        : VulkanResource(VulkanResourceType::DESCRIPTOR_SET_LAYOUT),
+          vklayout(layout),
+          bitmask(bitmask) {}
+
+    VkDescriptorSetLayout const vklayout;
+    Bitmask const bitmask;
+};
 
 struct VulkanProgram : public HwProgram, VulkanResource {
 
     VulkanProgram(VkDevice device, Program const& builder) noexcept;
 
-    struct CustomSamplerInfo {
-        uint8_t groupIndex;
-        uint8_t samplerIndex;
-        ShaderStageFlags flags;
-    };
-    using CustomSamplerInfoList = utils::FixedCapacityVector<CustomSamplerInfo>;
+    using BindingList = CappedArray<uint16_t, MAX_SAMPLER_COUNT>;
 
-    // We allow custom descriptor of the samplers within shaders.  This is needed if we want to use
-    // a program that exists only in the backend - for example, for shader-based bliting.
-    VulkanProgram(VkDevice device, VkShaderModule vs, VkShaderModule fs,
-            CustomSamplerInfoList const& samplerInfo) noexcept;
     ~VulkanProgram();
 
     inline VkShaderModule getVertexShader() const {
@@ -58,11 +74,24 @@ struct VulkanProgram : public HwProgram, VulkanResource {
 
     inline VkShaderModule getFragmentShader() const { return mInfo->shaders[1]; }
 
-    inline VulkanPipelineCache::UsageFlags getUsage() const { return mInfo->usage; }
-
     inline utils::FixedCapacityVector<uint16_t> const& getBindingToSamplerIndex() const {
         return mInfo->bindingToSamplerIndex;
     }
+
+    inline BindingList const& getBindings() const {
+        return mInfo->bindings;
+    }
+
+    // TODO: this is currently not used.
+    // inline descset::DescriptorSetLayout const& getBindingLayout() const {
+    //    return mInfo->layout;
+    //}
+
+    // TODO: in the usual case, we would have just one layout per program. But in the current setup,
+    // we have a set/layout for each descriptor type. This will be changed in the future.
+    using LayoutDescriptionList = std::array<descset::DescriptorSetLayout,
+            VulkanDescriptorSetLayout::UNIQUE_DESCRIPOR_SET_COUNT>;
+    inline LayoutDescriptionList const& getLayoutDescriptionList() const { return mInfo->layouts; }
 
 #if FVK_ENABLED_DEBUG_SAMPLER_NAME
     inline utils::FixedCapacityVector<std::string> const& getBindingToName() const {
@@ -80,16 +109,23 @@ private:
             : bindingToSamplerIndex(MAX_SAMPLER_COUNT, 0xffff)
 #if FVK_ENABLED_DEBUG_SAMPLER_NAME
             , bindingToName(MAX_SAMPLER_COUNT, "")
-#endif              
+#endif
             {}
 
         // This bitset maps to each of the sampler in the sampler groups associated with this
         // program, and whether each sampler is used in which shader (i.e. vert, frag, compute).
-        VulkanPipelineCache::UsageFlags usage;
+        UsageFlags usage;
+
+        BindingList bindings;
 
         // We store the samplerGroupIndex as the top 8-bit and the index within each group as the lower 8-bit.
         utils::FixedCapacityVector<uint16_t> bindingToSamplerIndex;
         VkShaderModule shaders[MAX_SHADER_MODULES] = { VK_NULL_HANDLE };
+
+        LayoutDescriptionList layouts;
+        
+        // TODO: this is currently not used.        
+        //descset::DescriptorSetLayout layout;
 
 #if FVK_ENABLED_DEBUG_SAMPLER_NAME
         // We store the sampler name mapped from binding index (only for debug purposes).
@@ -291,6 +327,33 @@ private:
 
     std::shared_ptr<VulkanCmdFence> mFence;
     utils::Mutex mFenceMutex;
+};
+
+struct VulkanDescriptorSet : public VulkanResource {
+public:
+    // Because we need to recycle descriptor set not used, we allow for a callback that the "Pool"
+    // can use to repackage the vk handle.
+    using OnRecycle = std::function<void(VulkanDescriptorSet*)>;
+
+    VulkanDescriptorSet(VulkanResourceAllocator* allocator,
+            VkDescriptorSet rawSet, OnRecycle&& onRecycleFn)
+        : VulkanResource(VulkanResourceType::DESCRIPTOR_SET),
+          resources(allocator),
+          vkSet(rawSet),
+          mOnRecycleFn(std::move(onRecycleFn)) {}
+
+    ~VulkanDescriptorSet() {
+        if (mOnRecycleFn) {
+            mOnRecycleFn(this);
+        }
+    }
+    
+    // TODO: maybe change to fixed size for performance.
+    VulkanAcquireOnlyResourceManager resources;
+    VkDescriptorSet const vkSet;
+
+private:
+    OnRecycle mOnRecycleFn;
 };
 
 inline constexpr VkBufferUsageFlagBits getBufferObjectUsage(
